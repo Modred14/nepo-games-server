@@ -16,8 +16,8 @@ const httpServer = createServer((req, res) => {
 const io = new Server(httpServer, {
   cors: {
     origin: [
-      "https://your-nepo-games.netlify.app", // your Netlify URL
-      "http://localhost:3000",                // local dev
+      "https://nepogames.netlify.app/", // your Netlify URL
+      "http://localhost:3000", // local dev
     ],
     methods: ["GET", "POST"],
   },
