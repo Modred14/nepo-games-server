@@ -1,7 +1,31 @@
+// ROUTE: index.js
 const { createServer } = require("http");
 const { Server } = require("socket.io");
 const https = require("https");
+const jwt = require("jsonwebtoken");
 require("dotenv").config();
+
+// FIX (critical, socket auth + real-time delivery bug): the "join"/"leave"
+// handlers used to accept a bare conversationId and do
+// `socket.join(\`room:${conversationId}\`)`. The client (see
+// nepo-games-main's Conversation.jsx / server.js) was updated to send a
+// signed token instead — `socket.emit("join", { room, token })` — so that
+// a client can only join a room it's actually a DB participant of.
+// Because this server was never updated to match, `conversationId` above
+// became the whole `{ room, token }` object, so sockets were joining a
+// room literally named "room:[object Object]" instead of e.g. "room:260"
+// or "user:80". That's why /emit kept returning 200 (the HTTP call to
+// this server succeeded) but no connected client ever received the
+// broadcast — nobody was actually in the room being emitted to.
+function verifyJoinToken(token) {
+  const secret = process.env.SOCKET_SECRET;
+  if (!secret || !token) return null;
+  try {
+    return jwt.verify(token, secret);
+  } catch {
+    return null;
+  }
+}
 
 process.on("uncaughtException", (err) => {
   console.error("Uncaught Exception:", err);
@@ -77,14 +101,32 @@ io.on("connection", (socket) => {
     console.error(`Socket error on ${socket.id}:`, err);
   });
 
-  socket.on("join", (conversationId) => {
-    socket.join(`room:${conversationId}`);
-    console.log(`Socket ${socket.id} joined room:${conversationId}`);
+  socket.on("join", (payload) => {
+    if (!payload || typeof payload !== "object") {
+      console.warn(`Socket ${socket.id} sent invalid join payload`);
+      return;
+    }
+    const { room, token } = payload;
+    if (!room || !token) return;
+
+    const decoded = verifyJoinToken(token);
+    if (!decoded || decoded.room !== room) {
+      console.warn(
+        `Socket ${socket.id} join rejected — invalid/mismatched token for room:`,
+        room,
+      );
+      return;
+    }
+
+    socket.join(room);
+    console.log(`Socket ${socket.id} joined ${room}`);
   });
 
-  socket.on("leave", (conversationId) => {
-    socket.leave(`room:${conversationId}`);
-    console.log(`Socket ${socket.id} left room:${conversationId}`);
+  socket.on("leave", (payload) => {
+    const room = typeof payload === "object" ? payload?.room : payload;
+    if (!room) return;
+    socket.leave(room);
+    console.log(`Socket ${socket.id} left ${room}`);
   });
 
   socket.on("disconnect", () => {
