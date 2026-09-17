@@ -78,6 +78,86 @@ const httpServer = createServer((req, res) => {
     return;
   }
 
+  // FIX (audit item D.1/D.2): reconciliation endpoint. When the
+  // Next.js app can't tell whether a /transfer call actually reached
+  // Flutterwave (network error/timeout between here and there, or
+  // between Next.js and this server), or when the transfer.completed
+  // webhook needs to double-check a payload before trusting it, it
+  // calls this instead of guessing. GET /v3/transfers is one of the
+  // endpoints covered by Flutterwave's mandatory IP whitelist (same
+  // bucket as /v3/transfers POST), so — same as the transfer itself —
+  // this has to be made from this server's whitelisted IP, not from
+  // Netlify.
+  if (req.url.startsWith("/transfer-status") && req.method === "GET") {
+    console.log(
+      "[/transfer-status] Incoming request from:",
+      req.socket.remoteAddress,
+    );
+
+    const secret = req.headers["x-transfer-secret"];
+    if (secret !== process.env.TRANSFER_SECRET) {
+      console.error(
+        "[/transfer-status] Forbidden — secret mismatch. Received:",
+        secret,
+      );
+      res.writeHead(403);
+      res.end("Forbidden");
+      return;
+    }
+
+    const reqUrl = new URL(req.url, "http://internal");
+    const reference = reqUrl.searchParams.get("reference");
+    const id = reqUrl.searchParams.get("id");
+
+    if (!reference && !id) {
+      res.writeHead(400, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ error: "reference or id is required" }));
+      return;
+    }
+
+    if (!process.env.FLW_SECRET_KEY) {
+      console.error("[/transfer-status] ERROR: FLW_SECRET_KEY is not set!");
+      res.writeHead(500, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ error: "Server misconfigured" }));
+      return;
+    }
+
+    // The outer request handler isn't async (see createServer below), so
+    // wrap the await calls in an IIFE — same pattern already used for
+    // the /transfer and /emit handlers via req.on("end", async () => {}).
+    (async () => {
+      try {
+        const flwUrl = id
+          ? `https://api.flutterwave.com/v3/transfers/${encodeURIComponent(id)}`
+          : `https://api.flutterwave.com/v3/transfers?reference=${encodeURIComponent(reference)}`;
+
+        const flwRes = await fetch(flwUrl, {
+          headers: { Authorization: `Bearer ${process.env.FLW_SECRET_KEY}` },
+        });
+
+        const flwData = await flwRes.json();
+        console.log(
+          "[/transfer-status] Flutterwave response:",
+          flwRes.status,
+          flwData.status,
+        );
+
+        res.writeHead(flwRes.ok ? 200 : 400, {
+          "Content-Type": "application/json",
+        });
+        res.end(JSON.stringify(flwData));
+      } catch (err) {
+        console.error("[/transfer-status] Flutterwave call failed:", err.message);
+        // Genuinely can't reach Flutterwave right now — this is still an
+        // ambiguous outcome, not a "not found". Say so explicitly so the
+        // caller doesn't mistake this for "transfer doesn't exist".
+        res.writeHead(502, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ error: "Status check failed", ambiguous: true }));
+      }
+    })();
+    return;
+  }
+
   if (req.url === "/transfer" && req.method === "POST") {
     console.log(
       "[/transfer] Incoming request from:",
@@ -155,9 +235,18 @@ const httpServer = createServer((req, res) => {
         });
         res.end(JSON.stringify(flwData));
       } catch (err) {
+        // FIX (audit item D.1): a thrown error here means the fetch to
+        // Flutterwave itself failed/timed out — it does NOT mean
+        // Flutterwave never received or processed the transfer. Mark
+        // this explicitly `ambiguous: true` so the caller (Next.js
+        // withdraw route) knows it must reconcile via
+        // /transfer-status instead of assuming the transfer failed
+        // and freeing up the user's balance.
         console.error("[/transfer] Flutterwave call failed:", err.message);
         res.writeHead(502, { "Content-Type": "application/json" });
-        res.end(JSON.stringify({ error: "Transfer request failed" }));
+        res.end(
+          JSON.stringify({ error: "Transfer request failed", ambiguous: true }),
+        );
       }
     });
     return;
