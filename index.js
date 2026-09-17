@@ -5,6 +5,31 @@ const https = require("https");
 const jwt = require("jsonwebtoken");
 require("dotenv").config();
 
+// NEW: background reconciliation loop (see reconcileStaleWithdrawals below
+// and its setInterval call near the bottom of this file). Was flagged as
+// missing in the withdrawal audit — rows left 'pending' past when a
+// webhook should have arrived, or 'unknown' after an ambiguous network
+// failure (see the /transfer-status handler above, audit item D.1), had
+// no automatic follow-up before this. This server is the natural home
+// for it: it's already an always-on process (not a Netlify serverless
+// function that can't run a background loop) and already holds
+// FLW_SECRET_KEY from the whitelisted IP needed to query Flutterwave.
+//
+// Requires `pg` (added to package.json) and DATABASE_URL to be set in
+// this server's environment — same connection string used by
+// nepo-games-main's src/lib/db.js. If DATABASE_URL isn't set, the loop
+// logs a warning once and simply doesn't run, rather than crashing the
+// socket server (which has nothing to do with the database otherwise).
+const { Pool } = require("pg");
+
+const dbPool = process.env.DATABASE_URL
+  ? new Pool({
+      connectionString: process.env.DATABASE_URL,
+      ssl: { rejectUnauthorized: false },
+      max: 3,
+    })
+  : null;
+
 // FIX (critical, socket auth + real-time delivery bug): the "join"/"leave"
 // handlers used to accept a bare conversationId and do
 // `socket.join(\`room:${conversationId}\`)`. The client (see
@@ -34,6 +59,128 @@ process.on("uncaughtException", (err) => {
 process.on("unhandledRejection", (reason) => {
   console.error("Unhandled Rejection:", reason);
 });
+
+// How old a 'pending' withdrawal must be before we bother asking
+// Flutterwave about it — gives the transfer.completed webhook a fair
+// chance to arrive normally first, instead of hammering Flutterwave's
+// API for every withdrawal on every sweep.
+const RECONCILE_PENDING_AFTER_MS = Number(
+  process.env.RECONCILE_PENDING_AFTER_MS || 10 * 60 * 1000, // 10 minutes
+);
+
+// How old a row must be before a "Flutterwave has no record of this
+// reference" result is trusted enough to mark it 'failed' — protects
+// against a transient/eventually-consistent lookup gap right after the
+// transfer was created.
+const RECONCILE_MARK_FAILED_AFTER_MS = Number(
+  process.env.RECONCILE_MARK_FAILED_AFTER_MS || 30 * 60 * 1000, // 30 minutes
+);
+
+async function checkTransferOnFlutterwave(reference) {
+  const flwRes = await fetch(
+    `https://api.flutterwave.com/v3/transfers?reference=${encodeURIComponent(reference)}`,
+    { headers: { Authorization: `Bearer ${process.env.FLW_SECRET_KEY}` } },
+  );
+  const flwData = await flwRes.json();
+  const record = Array.isArray(flwData?.data) ? flwData.data[0] : flwData?.data;
+  return { ok: flwRes.ok, found: Boolean(record), record };
+}
+
+// NEW: the actual reconciliation sweep. Picks up:
+//   - 'unknown' rows (ambiguous outcome from a prior /transfer or webhook
+//     call, see audit item D.1) — checked on every sweep, since these are
+//     rare and already flagged as needing attention
+//   - 'pending' rows older than RECONCILE_PENDING_AFTER_MS — the backstop
+//     for a missed/delayed transfer.completed webhook
+// and resolves each against Flutterwave's own transfer records, the same
+// way /transfer-status and the webhook handler do.
+async function reconcileStaleWithdrawals() {
+  if (!dbPool) return;
+
+  if (!process.env.FLW_SECRET_KEY) {
+    console.error("[reconcile] ERROR: FLW_SECRET_KEY is not set, skipping sweep");
+    return;
+  }
+
+  let rows;
+  try {
+    const result = await dbPool.query(
+      `
+      SELECT id, reference, status, created_at
+      FROM users_transactions
+      WHERE type = 'debit' AND description = 'Withdrawal'
+        AND (
+          status = 'unknown'
+          OR (status = 'pending' AND created_at < NOW() - ($1 || ' milliseconds')::interval)
+        )
+      ORDER BY created_at ASC
+      LIMIT 50
+      `,
+      [RECONCILE_PENDING_AFTER_MS],
+    );
+    rows = result.rows;
+  } catch (err) {
+    console.error("[reconcile] DB query failed:", err.message);
+    return;
+  }
+
+  if (rows.length === 0) {
+    console.log("[reconcile] No stale pending/unknown withdrawals to check.");
+    return;
+  }
+
+  console.log(`[reconcile] Checking ${rows.length} withdrawal(s) against Flutterwave...`);
+
+  for (const row of rows) {
+    try {
+      const { ok, found, record } = await checkTransferOnFlutterwave(row.reference);
+      const ageMs = Date.now() - new Date(row.created_at).getTime();
+      const flwStatus = found ? String(record?.status || "").toUpperCase() : null;
+
+      let newStatus = null;
+
+      if (found && flwStatus === "SUCCESSFUL") {
+        newStatus = "success";
+      } else if (found && flwStatus === "FAILED") {
+        newStatus = "failed";
+      } else if (!found && ok && ageMs > RECONCILE_MARK_FAILED_AFTER_MS) {
+        // Confirmed no record on Flutterwave's side, and old enough that
+        // this isn't just eventual-consistency lag — safe to call it failed.
+        newStatus = "failed";
+      } else if (!found || !ok) {
+        // Either genuinely not found yet (too young to be sure) or we
+        // couldn't get a clean answer from Flutterwave this sweep — leave
+        // it as 'unknown' so it's still held against the user's balance
+        // and gets picked up again next sweep.
+        newStatus = "unknown";
+      }
+      // else: found and still NEW/PENDING on Flutterwave's side — leave
+      // as-is, wait for the webhook or a later sweep.
+
+      if (newStatus && newStatus !== row.status) {
+        // WITHDRAWAL FEE: update by `reference`, not `id` — the
+        // 'Withdrawal fee' credit row (user_id=1, inserted by
+        // withdraw/route.js in nepo-games-main) shares this withdrawal's
+        // reference specifically so one UPDATE keeps both rows in sync.
+        await dbPool.query(`UPDATE users_transactions SET status = $1 WHERE reference = $2`, [
+          newStatus,
+          row.reference,
+        ]);
+        console.log(
+          `[reconcile] #${row.id} (${row.reference}): ${row.status} → ${newStatus}` +
+            (flwStatus ? ` (Flutterwave: ${flwStatus})` : " (not found on Flutterwave)"),
+        );
+      } else {
+        console.log(
+          `[reconcile] #${row.id} (${row.reference}): no change (${row.status})`,
+        );
+      }
+    } catch (err) {
+      console.error(`[reconcile] #${row.id} (${row.reference}) check failed:`, err.message);
+      // Leave it as-is; will be retried next sweep.
+    }
+  }
+}
 
 const httpServer = createServer((req, res) => {
   if (req.url === "/health") {
@@ -324,6 +471,37 @@ if (process.env.NODE_ENV === "production") {
         });
     },
     10 * 60 * 1000,
+  );
+}
+
+// NEW: run the withdrawal reconciliation sweep periodically. Interval is
+// configurable via RECONCILE_INTERVAL_MS; defaults to every 5 minutes.
+// No-ops internally (see reconcileStaleWithdrawals) if DATABASE_URL isn't
+// configured, so this is safe to leave in even before that's set up.
+if (dbPool) {
+  const reconcileIntervalMs = Number(
+    process.env.RECONCILE_INTERVAL_MS || 5 * 60 * 1000,
+  );
+  console.log(
+    `[reconcile] Withdrawal reconciliation sweep enabled, every ${reconcileIntervalMs / 1000}s`,
+  );
+  setInterval(() => {
+    reconcileStaleWithdrawals().catch((err) =>
+      console.error("[reconcile] Sweep crashed:", err),
+    );
+  }, reconcileIntervalMs);
+  // Also run one sweep shortly after startup rather than waiting a full
+  // interval, so a restart doesn't leave stale rows sitting for longer
+  // than necessary.
+  setTimeout(() => {
+    reconcileStaleWithdrawals().catch((err) =>
+      console.error("[reconcile] Startup sweep crashed:", err),
+    );
+  }, 30 * 1000);
+} else {
+  console.warn(
+    "[reconcile] DATABASE_URL is not set — withdrawal reconciliation sweep is DISABLED. " +
+      "Stale 'pending'/'unknown' withdrawals will only be resolved by webhooks or manual admin recheck.",
   );
 }
 
