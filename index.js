@@ -78,6 +78,91 @@ const httpServer = createServer((req, res) => {
     return;
   }
 
+  if (req.url === "/transfer" && req.method === "POST") {
+    console.log(
+      "[/transfer] Incoming request from:",
+      req.socket.remoteAddress,
+    );
+
+    const secret = req.headers["x-transfer-secret"];
+    if (secret !== process.env.TRANSFER_SECRET) {
+      console.error(
+        "[/transfer] Forbidden — secret mismatch. Received:",
+        secret,
+      );
+      res.writeHead(403);
+      res.end("Forbidden");
+      return;
+    }
+
+    let body = "";
+    req.on("data", (chunk) => {
+      body += chunk;
+    });
+    req.on("end", async () => {
+      let payload;
+      try {
+        payload = JSON.parse(body);
+      } catch (err) {
+        console.error("[/transfer] Parse error:", err);
+        res.writeHead(400);
+        res.end("Bad request");
+        return;
+      }
+
+      const { account_bank, account_number, amount, currency, narration, reference } =
+        payload || {};
+
+      if (!account_bank || !account_number || !amount || !reference) {
+        res.writeHead(400, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ error: "Missing required transfer fields" }));
+        return;
+      }
+
+      if (!process.env.FLW_SECRET_KEY) {
+        console.error("[/transfer] ERROR: FLW_SECRET_KEY is not set!");
+        res.writeHead(500, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ error: "Server misconfigured" }));
+        return;
+      }
+
+      try {
+        const flwRes = await fetch("https://api.flutterwave.com/v3/transfers", {
+          method: "POST",
+          headers: {
+            Authorization: `Bearer ${process.env.FLW_SECRET_KEY}`,
+            "Content-Type": "application/json",
+          },
+          body: JSON.stringify({
+            account_bank,
+            account_number,
+            amount,
+            currency: currency || "NGN",
+            narration: narration || "Wallet withdrawal",
+            reference,
+          }),
+        });
+
+        const flwData = await flwRes.json();
+        console.log(
+          "[/transfer] Flutterwave response:",
+          flwRes.status,
+          flwData.status,
+        );
+
+        res.writeHead(flwRes.ok ? 200 : 400, {
+          "Content-Type": "application/json",
+        });
+        res.end(JSON.stringify(flwData));
+      } catch (err) {
+        console.error("[/transfer] Flutterwave call failed:", err.message);
+        res.writeHead(502, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ error: "Transfer request failed" }));
+      }
+    });
+    return;
+  }
+
   res.writeHead(404);
   res.end();
 });
